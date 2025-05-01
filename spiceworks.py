@@ -1,111 +1,24 @@
-
-import requests
-import re
+import os
 import time
 from datetime import datetime
-import random
-import os
-import cloudscraper
+from msgraph import GraphServiceClient
+from kiota_abstractions.base_request_configuration import RequestConfiguration
+from msgraph.generated.users.item.messages.messages_request_builder import MessagesRequestBuilder
 from dotenv import load_dotenv
-
-# Load the .env file
-load_dotenv()
-
-# Access the values
-email = os.getenv("EMAIL")
-password = os.getenv("PASSWORD")
-
 from gpiozero import OutputDevice
+import requests
+
+# Load environment variables
+load_dotenv()
+pushoverUser = os.getenv("PUSHOVER_USER")
+pushoverToken = os.getenv("PUSHOVER_TOKEN")
+
+# GPIO setup
 RELAY_PIN = 26
 relay = OutputDevice(RELAY_PIN, active_high=False)
 
-# Loosely based to a script a php script for accessing an earlier version of spiceworks.
-# see https://github.com/anthonyeden/spiceworks_api/blob/master/Spiceworks-External-JSON-API-v1.php
-
-class SpiceworksSession:
-    sesh = None
-    email = ""
-    password = ""
-    testURL = "https://denstonecollegeit.on.spiceworks.com"
-    loginURL = "https://accounts.spiceworks.com/sign_in"
-    ticketsURL = "https://denstonecollegeit.on.spiceworks.com/api/tickets.json"
-    ticketsURL = "https://on.spiceworks.com/api/main/tickets?sort=created_at-desc&page[number]=1&page[size]=10&filter[status][eq]=open"
-    userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
-
-    def __init__(self, email, password):
-        self.email = email
-        self.password = password
-
-    def getToken(self, respsonseText):
-        # find authenticity token. If we find it we are not logged in.
-        #m = re.search('name="authenticity_token".*value="(.*?)"', respsonseText)
-        # Changed location of token sometime in late 2023
-        m = re.search('content="authenticity_token" \/>\\n<meta name="csrf-token" content="(.*?)"', respsonseText)
-        if bool(m):
-            return m.group(1)
-        else:   
-            return None
-
-    def login(self):
-
-        # Check we aren't already logged in by called spiceworks and seeing if a login page is returned.
-
-        if isinstance(self.sesh, requests.Session) == False:
-            # Setup a session to automatically handle the cookies.
-            self.sesh = cloudscraper.create_scraper()
-
-        customHeaders = {"host":"accounts.spiceworks.com","User-Agent":self.userAgent}
-        r = self.sesh.get(self.testURL, allow_redirects=True, headers=customHeaders)        
-        authenticityToken = self.getToken(r.text)
-
-        # If we find the login page then we must log in.
-        if authenticityToken != None:
-            print("Token=" + authenticityToken)
-            postFields = {
-                "utf8": "✓",
-                "authenticity_token": authenticityToken,
-                "email": self.email,
-                "password": self.password,
-                "success": "https://denstonecollegeit.on.spiceworks.com/auth/spiceworks/callback",
-                "permission_denied:": "https://accounts.spiceworks.com/",
-                "policy": "hosted_help_desk",
-                "commit": "Log in"
-            }
-
-            # call the login page with the required post data
-            customHeaders = {
-                "Host": "accounts.spiceworks.com",
-                "User-Agent": self.userAgent,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "https://denstonecollegeit.on.spiceworks.com/tickets/open/1?sort=updated_at-desc",
-                "Origin": "https://accounts.spiceworks.com",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "en-US,en;q=0.9"
-            }
-            loginResponse = self.sesh.post(self.loginURL, data=postFields, headers=customHeaders)
-            print("Login attempt response: ", loginResponse.status_code)
-            return True
-        else: 
-            print("Already Logged in")
-            return True
-
-
-    def getTickets(self):
-        customHeaders = {"User-Agent":self.userAgent}
-        ticketResponse = self.sesh.get(self.ticketsURL,headers=customHeaders)
-        print("Ticket request response: ", ticketResponse.status_code)
-        if ticketResponse.status_code == 200:
-            return ticketResponse.json()
-        else:
-            return None
-
-
-def triggerNotification(title="New Ticket", message="New Ticket Alert"):
-    
-    pushoverUser = os.getenv("PUSHOVER_USER")
-    pushoverToken = os.getenv("PUSHOVER_TOKEN")
-
+# Trigger Pushover notification
+def triggerNotification(title="New Email", message="New message received"):
     payload = {
         'token': pushoverToken,
         'user': pushoverUser,
@@ -114,75 +27,77 @@ def triggerNotification(title="New Ticket", message="New Ticket Alert"):
         'priority': 1,
         'sound': 'pushover',
     }
-    
-    # Send the request
-    response = requests.post('https://api.pushover.net/1/messages.json', data=payload)
+    requests.post('https://api.pushover.net/1/messages.json', data=payload)
 
+# Trigger the GPIO relay
 def triggerRelay():
     relay.on()
     time.sleep(10)
     relay.off()
 
+def save_last_message_id(message_id):
+    with open("last_message_id.txt", "w") as f:
+        f.write(message_id)
 
-def processTicketData(ticketData):
-    # Make sure that the previous timestamp file exists
-    with open('saved_timestamp.txt', 'a'):
-        pass
+def load_last_message_id():
+    try:
+        with open("last_message_id.txt", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+# Save and compare timestamps
+def processEmailData(emails):
+
+    if not emails:
+        print("No emails to process")
+        return
     
-    # Do we have tickets to process?
-    if ticketData and len(ticketData["tickets"]) > 0  :
-        print("Ticket data retreived")
+    # Filter out emails from known senders
+    ignoreList = [
+        "aemmerson@denstonecollege.net", 
+        "mfinney@denstonecollege.net",
+        "mtovey@denstonecollege.net",
+        "support@denstonecollege.net"
+    ]    
+    emails = [email for email in emails if email.sender.email_address.address not in ignoreList]
+    if emails.count == 0:
+        # No emails to process
+        print("No emails to process - post filter")
+        return
+    
+    # Sort emails by received date and get the latest one
+    latest_email = sorted(emails, key=lambda m: m.received_date_time, reverse=True)[0]
 
-        # Check what the time of the last ticket was
-        with open('saved_timestamp.txt') as text_file:
-            saved_string = text_file.read()
-            if(len(saved_string) == 0):
-                # we don't have a previous timestamp so lets save the current timestamp and notify
-                triggerNotification()
-                triggerRelay()
-                with open('saved_timestamp.txt', 'w') as text_file:
-                    # Save the new current date
-                    text_file.write(datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
-            else:
-                saved_date = datetime.strptime(saved_string.split('.')[0], '%Y-%m-%dT%H:%M:%S')
-                # filter out any tickets from email addresses we don't want to notify about
-                ignoreEmails = ["aemmerson@denstonecollege.net",
-                              "mtovey@denstonecollege.net",
-                              "mfinney@denstonecollege.net",
-                              "noreply@roombookingsystem.co.uk"
-                              ]
-                externalTickets = [ticket for ticket in ticketData["tickets"] if ticket["creator"]["email"] not in ignoreEmails]
-                if(len(externalTickets)>0):
-                    # Find when the latest ticket was created
-                    latest_string = externalTickets[0]["created_at"]
-                    latest_date = datetime.strptime(latest_string.split('.')[0],'%Y-%m-%dT%H:%M:%S')
+    # if the latest email is different from the last saved one, trigger notification and relay
+    if latest_email.internet_message_id != load_last_message_id():
+        print("New support email received - notifying", latest_email.subject)
+        triggerNotification(title="New Ticket", message=latest_email.subject)
+        triggerRelay()
+        save_last_message_id(latest_email.internet_message_id)
+    else:
+        print("Latest email is the same as the last saved one - no action taken")
 
-                    with open('saved_timestamp.txt', 'w') as text_file:
-                            # Save the new current date
-                            text_file.write(latest_string)       
-                    # If the latest ticket is newer than the last time we checked then notify
-                    if latest_date > saved_date:
-                        print("Recent tickets found - notifications sent")
-                        title = "New Ticket from {}".format(externalTickets[0]["creator"]["name"])
-                        message = externalTickets[0]["summary"]
-                        triggerNotification(title, message)
-                        triggerRelay()
+# Main function using Microsoft Graph
+async def check_emails(graph_client: GraphServiceClient):
+    query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+        select=["sender", "subject", "receivedDateTime", "internetMessageId"],
+        top=10
+    )
+    request_config = RequestConfiguration(query_parameters=query_params)
+    result = await graph_client.users.by_user_id("support@denstonecollege.net").messages.get(request_configuration=request_config)
 
-print("Script called at ", datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
+    if result and result.value:
+        processEmailData(result.value)
 
-# Reset relay
-relay.off()
+# Entry point for cron execution
+if __name__ == "__main__":
+    print("Script called at", datetime.now().strftime('%Y-%m-%dT%H:%M:%S'))
+    relay.off()
+    time.sleep(1)  # optional: slight delay
 
-# Wait a variable number of seconds to try to avoid cloudflare issues
-time.sleep(random.uniform(0, 10))
-sw = SpiceworksSession(email, password)
+    import asyncio
+    from graph_client_builder import get_graph_client  # you need to implement this based on your auth flow
 
-sw.login()
-ticketsData = sw.getTickets()
-#print(ticketsData)
-processTicketData(ticketsData)
-
-
-
-
-
+    asyncio.run(check_emails(get_graph_client()))

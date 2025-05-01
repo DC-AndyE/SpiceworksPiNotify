@@ -1,1 +1,5 @@
 cloudscraper
+python-dotenv
+azure-identity
+msgraph-sdk
+gpiozero
